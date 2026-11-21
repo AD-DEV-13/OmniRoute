@@ -216,6 +216,7 @@
       "proxyLog",
       "proxyLogger",
       "reasoningRouting",
+      "reports",
       "requestLogger",
       "requestTimeline",
       "sharedComponents",
