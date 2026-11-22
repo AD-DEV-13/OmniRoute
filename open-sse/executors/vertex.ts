@@ -148,6 +148,26 @@ function isClaudeModel(model: string) {
   return model.toLowerCase().startsWith("claude-");
 }
 
+/**
+ * Newer Vertex AI Gemini chat families reject a request ending on a model turn with:
+ * `400 INVALID_ARGUMENT: Requests ending with a model turn are not supported.`
+ *
+ * Keep this explicit rather than matching every non-Claude model: partner models (MaaS),
+ * image generation models, and older Gemini families (e.g. 2.5) predate or fall outside
+ * this restriction (see #10104).
+ */
+export function isVertexGeminiTrailingTurnRestrictedModel(model: string): boolean {
+  if (isPartnerModel(model)) {
+    return false;
+  }
+  const normalized = model.toLowerCase();
+  const baseModel = normalized.includes("/") ? normalized.split("/").pop() || "" : normalized;
+  if (/(?:^|-)image(?:-|$)/.test(baseModel)) {
+    return false;
+  }
+  return /^gemini-(?:[34](?:\.\d+)?(?:-[a-z0-9-]+)?|pro-agent)$/.test(baseModel);
+}
+
 // Defensive normalizer: target-format resolution for manually-added custom Claude models under
 // "vertex"/"vertex-partner" was observed sending a Gemini-shaped body (contents/parts) to the
 // Anthropic rawPredict endpoint instead of the configured "claude" format, causing a hard
@@ -361,7 +381,11 @@ export class VertexExecutor extends BaseExecutor {
       // one (the openai→claude request translator copies the client's model field over).
       delete body.model;
     }
-    if (!isClaudeModel(model) && input.body && typeof input.body === "object") {
+    if (
+      isVertexGeminiTrailingTurnRestrictedModel(model) &&
+      input.body &&
+      typeof input.body === "object"
+    ) {
       stripTrailingVertexModelTurn(input.body as Record<string, unknown>);
     }
 
