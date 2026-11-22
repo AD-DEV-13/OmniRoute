@@ -52,7 +52,9 @@ export function looksLikeServiceAccountJson(apiKey: string): boolean {
 
 /** True for a Vertex AI Express-mode API key (a non-empty, non-JSON, non-OAuth credential). */
 export function isExpressApiKey(apiKey?: string | null): boolean {
-  return typeof apiKey === "string" && apiKey.trim().length > 0 && !looksLikeServiceAccountJson(apiKey);
+  return (
+    typeof apiKey === "string" && apiKey.trim().length > 0 && !looksLikeServiceAccountJson(apiKey)
+  );
 }
 
 export async function getAccessToken(sa: ServiceAccount): Promise<string> {
@@ -153,7 +155,8 @@ function isClaudeModel(model: string) {
 // converts a Gemini-shaped body to Anthropic Messages shape so the executor works either way,
 // independent of that unresolved upstream resolution gap.
 function toAnthropicBody(body: Record<string, unknown>): Record<string, unknown> {
-  const contents = body.contents as Array<{ role?: string; parts?: Array<{ text?: string }> }> | undefined;
+  const contents = body.contents as
+    Array<{ role?: string; parts?: Array<{ text?: string }> }> | undefined;
   if (!Array.isArray(contents)) return body;
 
   const messages = contents.map((c) => ({
@@ -161,7 +164,8 @@ function toAnthropicBody(body: Record<string, unknown>): Record<string, unknown>
     content: (c.parts || []).map((p) => p.text || "").join(""),
   }));
   const generationConfig = body.generationConfig as { maxOutputTokens?: number } | undefined;
-  const systemInstruction = body.systemInstruction as { parts?: Array<{ text?: string }> } | undefined;
+  const systemInstruction = body.systemInstruction as
+    { parts?: Array<{ text?: string }> } | undefined;
 
   const converted: Record<string, unknown> = {
     messages,
@@ -244,7 +248,11 @@ function synthesizeClaudeSse(response: Record<string, unknown>): string {
     } else if (block.type === "thinking") {
       events.push({
         event: "content_block_start",
-        data: { type: "content_block_start", index, content_block: { type: "thinking", thinking: "" } },
+        data: {
+          type: "content_block_start",
+          index,
+          content_block: { type: "thinking", thinking: "" },
+        },
       });
       if (block.thinking) {
         events.push({
@@ -273,6 +281,44 @@ function synthesizeClaudeSse(response: Record<string, unknown>): string {
 
   return events.map((e) => `event: ${e.event}\ndata: ${JSON.stringify(e.data)}\n\n`).join("");
 }
+/**
+ * Vertex AI (aiplatform.googleapis.com) strictly rejects any request ending on a
+ * model turn with `400 INVALID_ARGUMENT: Requests ending with a model turn are not supported.`
+ *
+ * When an agentic harness emits tool calls followed by contextualized tool results
+ * or when a trailing assistant prefill / turn is present in `contents`, Vertex AI
+ * rejects the entire batch.
+ *
+ * Mirrors the trailing-strip pop-loop in Antigravity (`stripTrailingAntigravityAssistantTurn`, #10104).
+ * Guard: never strip `contents` down to empty — at least one entry is always preserved.
+ */
+interface VertexContentLike {
+  role?: string;
+  parts?: unknown[];
+}
+
+export function stripTrailingVertexModelTurn(
+  request: Record<string, unknown>
+): Record<string, unknown> {
+  const contents = request.contents;
+  if (!Array.isArray(contents) || contents.length === 0) {
+    return request;
+  }
+
+  while (contents.length > 1) {
+    const last = contents[contents.length - 1];
+    if (last && typeof last === "object" && "role" in last) {
+      const typed = last as VertexContentLike;
+      if (typed.role === "model") {
+        contents.pop();
+        continue;
+      }
+    }
+    break;
+  }
+
+  return request;
+}
 
 export class VertexExecutor extends BaseExecutor {
   constructor() {
@@ -287,7 +333,11 @@ export class VertexExecutor extends BaseExecutor {
     }
     // Service Account JSON → mint a short-lived OAuth token (Bearer). An Express-mode API key is
     // sent as-is via x-goog-api-key (see buildHeaders), so no token exchange is needed for it.
-    if (credentials.apiKey && !credentials.accessToken && looksLikeServiceAccountJson(credentials.apiKey)) {
+    if (
+      credentials.apiKey &&
+      !credentials.accessToken &&
+      looksLikeServiceAccountJson(credentials.apiKey)
+    ) {
       try {
         const sa = parseSAFromApiKey(credentials.apiKey);
         credentials.accessToken = await getAccessToken(sa);
@@ -311,6 +361,9 @@ export class VertexExecutor extends BaseExecutor {
       // one (the openai→claude request translator copies the client's model field over).
       delete body.model;
     }
+    if (!isClaudeModel(model) && input.body && typeof input.body === "object") {
+      stripTrailingVertexModelTurn(input.body as Record<string, unknown>);
+    }
 
     const result = await super.execute(input);
 
@@ -318,7 +371,10 @@ export class VertexExecutor extends BaseExecutor {
       const response = result instanceof Response ? result : result?.response;
       if (response?.ok) {
         const contentType = response.headers.get("content-type") || "";
-        if (contentType.includes("application/json") && !contentType.includes("text/event-stream")) {
+        if (
+          contentType.includes("application/json") &&
+          !contentType.includes("text/event-stream")
+        ) {
           const jsonText = await response.text();
           let newBody = jsonText;
           let newContentType = contentType;
