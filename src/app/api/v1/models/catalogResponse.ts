@@ -52,6 +52,7 @@ import {
 } from "@/shared/utils/featureFlags";
 import { extractApiKey } from "@/sse/services/auth";
 import { maybeOmitCatalogModelName, withCatalogDisplayName } from "./catalogHelpers";
+import { labelCatalogModelNames } from "./catalogProviderLabel";
 import { applyCatalogPage, catalogJsonResponse, parseCatalogPage } from "./catalogPagination";
 import { isCodexModelCatalogClient } from "./catalogRequest";
 import {
@@ -412,7 +413,8 @@ export async function finalizeCatalogResponse(
   finalModels: Array<Record<string, unknown>>,
   getContextFallback: (model: Record<string, unknown>) => number | undefined,
   headers: Record<string, string>,
-  enrichmentSnapshot?: CatalogEnrichmentSnapshot
+  enrichmentSnapshot?: CatalogEnrichmentSnapshot,
+  options: { providerInName?: boolean } = {}
 ): Promise<Response> {
   const apiKey = extractApiKey(request);
   if (apiKey) {
@@ -466,7 +468,13 @@ export async function finalizeCatalogResponse(
     }
   }
   await yieldTurn();
-  const enrichedModels = disambiguateCatalogModelNames(enriched);
+  // The provider label already makes names unique per route, so #4516's
+  // `prefix/Name` qualifier would only double up on it.
+  // Labeling runs over the whole list (not per row) so OpenRouter rows whose
+  // vendor-stripped names would collide can keep their vendor prefix.
+  const enrichedModels = options.providerInName
+    ? labelCatalogModelNames(enriched)
+    : disambiguateCatalogModelNames(enriched);
   await yieldTurn();
   const orderedModels = sortCatalogModelsProviderGrouped(enrichedModels);
   await yieldTurn();
