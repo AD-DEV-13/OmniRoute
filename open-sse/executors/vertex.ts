@@ -270,6 +270,26 @@ function downgradeUnsupportedVertexClaudeTtl(body: Record<string, unknown>, mode
   if (Array.isArray(tools)) tools.forEach(normalizeBlock);
 }
 
+/**
+ * Newer Vertex AI Gemini chat families reject a request ending on a model turn with:
+ * `400 INVALID_ARGUMENT: Requests ending with a model turn are not supported.`
+ *
+ * Keep this explicit rather than matching every non-Claude model: partner models (MaaS),
+ * image generation models, and older Gemini families (e.g. 2.5) predate or fall outside
+ * this restriction (see #10104).
+ */
+export function isVertexGeminiTrailingTurnRestrictedModel(model: string): boolean {
+  if (isPartnerModel(model)) {
+    return false;
+  }
+  const normalized = model.toLowerCase();
+  const baseModel = normalized.includes("/") ? normalized.split("/").pop() || "" : normalized;
+  if (/(?:^|-)image(?:-|$)/.test(baseModel)) {
+    return false;
+  }
+  return /^gemini-(?:[34](?:\.\d+)?(?:-[a-z0-9-]+)?|pro-agent)$/.test(baseModel);
+}
+
 // Defensive normalizer: target-format resolution for manually-added custom Claude models under
 // "vertex"/"vertex-partner" was observed sending a Gemini-shaped body (contents/parts) to the
 // Anthropic rawPredict endpoint instead of the configured "claude" format, causing a hard
@@ -413,6 +433,86 @@ function synthesizeClaudeSse(response: Record<string, unknown>): string {
 
   return events.map((e) => `event: ${e.event}\ndata: ${JSON.stringify(e.data)}\n\n`).join("");
 }
+/**
+ * Vertex AI (aiplatform.googleapis.com) strictly rejects any request ending on a
+ * model turn with `400 INVALID_ARGUMENT: Requests ending with a model turn are not supported.`
+ *
+ * When an agentic harness emits tool calls followed by contextualized tool results
+ * or when a trailing assistant prefill / turn is present in `contents`, Vertex AI
+ * rejects the entire batch.
+ *
+ * Mirrors the trailing-strip pop-loop in Antigravity (`stripTrailingAntigravityAssistantTurn`, #10104).
+ * Guard: never strip `contents` down to empty — at least one entry is always preserved.
+ */
+interface VertexContentLike {
+  role?: string;
+  parts?: unknown[];
+}
+
+export function stripTrailingVertexModelTurn(
+  request: Record<string, unknown>
+): Record<string, unknown> {
+  const contents = request.contents;
+  if (!Array.isArray(contents) || contents.length === 0) {
+    return request;
+  }
+
+  while (contents.length > 1) {
+    const last = contents[contents.length - 1];
+    if (last && typeof last === "object" && "role" in last) {
+      const typed = last as VertexContentLike;
+      if (typed.role === "model") {
+        contents.pop();
+        continue;
+      }
+    }
+    break;
+  }
+
+  return request;
+}
+/**
+ * Vertex AI rejects any Content turn that mixes functionResponse parts with text/inlineData parts.
+ * When an agentic harness injects user reminders/context directly after a tool result turn,
+ * mergeConsecutiveSameRoleContents merges them into a single `user` turn containing both.
+ * This separates functionResponse parts from user text parts with an intervening model turn
+ * so Vertex's strict turn alternator is satisfied.
+ */
+export function separateMixedFunctionResponseTurns(
+  request: Record<string, unknown>
+): Record<string, unknown> {
+  const contents = request.contents;
+  if (!Array.isArray(contents) || contents.length === 0) {
+    return request;
+  }
+
+  for (let i = 0; i < contents.length; i++) {
+    const turn = contents[i];
+    if (turn && typeof turn === "object" && turn.role === "user" && Array.isArray(turn.parts)) {
+      const parts = turn.parts as Array<Record<string, unknown>>;
+      const fnIdx = parts.findIndex((p) => p && typeof p === "object" && "functionResponse" in p);
+      const textIdx = parts.findIndex(
+        (p) => p && typeof p === "object" && ("text" in p || "inlineData" in p)
+      );
+      if (fnIdx !== -1 && textIdx !== -1) {
+        const fnParts = parts.filter((p) => p && typeof p === "object" && "functionResponse" in p);
+        const otherParts = parts.filter(
+          (p) => !p || typeof p !== "object" || !("functionResponse" in p)
+        );
+        turn.parts = fnParts;
+        contents.splice(
+          i + 1,
+          0,
+          { role: "model", parts: [{ text: "Understood." }] },
+          { role: "user", parts: otherParts }
+        );
+        i += 2;
+      }
+    }
+  }
+
+  return request;
+}
 
 export class VertexExecutor extends BaseExecutor {
   constructor() {
@@ -471,6 +571,30 @@ export class VertexExecutor extends BaseExecutor {
       // one (the openai→claude request translator copies the client's model field over).
       delete body.model;
       downgradeUnsupportedVertexClaudeTtl(body, model);
+    }
+    if (
+      isVertexGeminiTrailingTurnRestrictedModel(model) &&
+      input.body &&
+      typeof input.body === "object"
+    ) {
+      separateMixedFunctionResponseTurns(input.body as Record<string, unknown>);
+      stripTrailingVertexModelTurn(input.body as Record<string, unknown>);
+    }
+    if (input.body && typeof input.body === "object") {
+      const genConfig = (input.body as Record<string, unknown>).generationConfig;
+      if (genConfig && typeof genConfig === "object" && "thinkingConfig" in genConfig) {
+        const tc = (genConfig as Record<string, unknown>).thinkingConfig;
+        if (tc && typeof tc === "object" && "thinkingBudget" in tc) {
+          const modelLower = model.toLowerCase();
+          if (modelLower.includes("gemini-4")) {
+            const rawBudget = (tc as Record<string, unknown>).thinkingBudget;
+            delete (tc as Record<string, unknown>).thinkingBudget;
+            const b = typeof rawBudget === "number" ? rawBudget : 8192;
+            (tc as Record<string, unknown>).thinkingLevel =
+              b <= 2048 ? "low" : b <= 8192 ? "medium" : "high";
+          }
+        }
+      }
     }
 
     const result = await super.execute(input);
