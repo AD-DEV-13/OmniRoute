@@ -431,6 +431,22 @@ export class VertexExecutor extends BaseExecutor {
       separateMixedFunctionResponseTurns(input.body as Record<string, unknown>);
       stripTrailingVertexModelTurn(input.body as Record<string, unknown>);
     }
+    if (input.body && typeof input.body === "object") {
+      const genConfig = (input.body as Record<string, unknown>).generationConfig;
+      if (genConfig && typeof genConfig === "object" && "thinkingConfig" in genConfig) {
+        const tc = (genConfig as Record<string, unknown>).thinkingConfig;
+        if (tc && typeof tc === "object" && "thinkingBudget" in tc) {
+          const modelLower = model.toLowerCase();
+          if (modelLower.includes("gemini-4")) {
+            const rawBudget = (tc as Record<string, unknown>).thinkingBudget;
+            delete (tc as Record<string, unknown>).thinkingBudget;
+            const b = typeof rawBudget === "number" ? rawBudget : 8192;
+            (tc as Record<string, unknown>).thinkingLevel =
+              b <= 2048 ? "low" : b <= 8192 ? "medium" : "high";
+          }
+        }
+      }
+    }
 
     const result = await super.execute(input);
 
