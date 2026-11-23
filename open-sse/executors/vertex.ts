@@ -339,6 +339,48 @@ export function stripTrailingVertexModelTurn(
 
   return request;
 }
+/**
+ * Vertex AI rejects any Content turn that mixes functionResponse parts with text/inlineData parts.
+ * When an agentic harness injects user reminders/context directly after a tool result turn,
+ * mergeConsecutiveSameRoleContents merges them into a single `user` turn containing both.
+ * This separates functionResponse parts from user text parts with an intervening model turn
+ * so Vertex's strict turn alternator is satisfied.
+ */
+export function separateMixedFunctionResponseTurns(
+  request: Record<string, unknown>
+): Record<string, unknown> {
+  const contents = request.contents;
+  if (!Array.isArray(contents) || contents.length === 0) {
+    return request;
+  }
+
+  for (let i = 0; i < contents.length; i++) {
+    const turn = contents[i];
+    if (turn && typeof turn === "object" && turn.role === "user" && Array.isArray(turn.parts)) {
+      const parts = turn.parts as Array<Record<string, unknown>>;
+      const fnIdx = parts.findIndex((p) => p && typeof p === "object" && "functionResponse" in p);
+      const textIdx = parts.findIndex(
+        (p) => p && typeof p === "object" && ("text" in p || "inlineData" in p)
+      );
+      if (fnIdx !== -1 && textIdx !== -1) {
+        const fnParts = parts.filter((p) => p && typeof p === "object" && "functionResponse" in p);
+        const otherParts = parts.filter(
+          (p) => !p || typeof p !== "object" || !("functionResponse" in p)
+        );
+        turn.parts = fnParts;
+        contents.splice(
+          i + 1,
+          0,
+          { role: "model", parts: [{ text: "Understood." }] },
+          { role: "user", parts: otherParts }
+        );
+        i += 2;
+      }
+    }
+  }
+
+  return request;
+}
 
 export class VertexExecutor extends BaseExecutor {
   constructor() {
@@ -386,6 +428,7 @@ export class VertexExecutor extends BaseExecutor {
       input.body &&
       typeof input.body === "object"
     ) {
+      separateMixedFunctionResponseTurns(input.body as Record<string, unknown>);
       stripTrailingVertexModelTurn(input.body as Record<string, unknown>);
     }
 

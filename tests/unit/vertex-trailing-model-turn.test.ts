@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   stripTrailingVertexModelTurn,
   isVertexGeminiTrailingTurnRestrictedModel,
+  separateMixedFunctionResponseTurns,
 } from "../../open-sse/executors/vertex.ts";
 
 /**
@@ -143,4 +144,35 @@ test("(h) regression: prefilled contents reaching a model predating the restrict
 
   assert.equal(request.contents.length, 2, "prefill must be preserved for legacy models");
   assert.equal(request.contents[1].role, "model", "trailing model turn must remain intact");
+});
+
+test("(i) separates mixed functionResponse and text parts with an intervening model turn", () => {
+  const request = {
+    contents: [
+      {
+        role: "user",
+        parts: [
+          {
+            functionResponse: {
+              name: "write",
+              response: { result: "ok" },
+            },
+          },
+          {
+            text: "<system-reminder>Don't do dynamic imports</system-reminder>",
+          },
+        ],
+      },
+    ],
+  };
+
+  separateMixedFunctionResponseTurns(request);
+
+  assert.equal(request.contents.length, 3);
+  assert.equal(request.contents[0].role, "user");
+  assert.deepEqual(Object.keys(request.contents[0].parts[0]), ["functionResponse"]);
+  assert.equal(request.contents[1].role, "model");
+  assert.deepEqual(request.contents[1].parts[0], { text: "Understood." });
+  assert.equal(request.contents[2].role, "user");
+  assert.deepEqual(Object.keys(request.contents[2].parts[0]), ["text"]);
 });
